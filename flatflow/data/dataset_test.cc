@@ -81,6 +81,9 @@ class DatasetTest : public testing::Test {
     constexpr auto kMaxSize = static_cast<uint16_t>(1 << 12);
     constexpr auto kMaxCount = static_cast<std::size_t>(1 << 15);
 
+    absl::InitializeLog();
+    absl::SetStderrThreshold(absl::LogSeverity::kInfo);
+
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
 
     auto capacity = static_cast<std::size_t>(0);
@@ -104,8 +107,9 @@ class DatasetTest : public testing::Test {
     auto data__ = builder.CreateVector64(data);
     auto offset = CreateSizes(builder, data__);
     builder.Finish(offset);
+
     auto sizes = GetSizes(builder.GetBufferPointer());
-    dataset_ = std::move(Dataset(sizes->data(), 0));
+    dataset_ = Dataset(sizes->data(), 0);
   }
 
   std::map<uint16_t, std::size_t> counts_;

@@ -63,9 +63,14 @@ class Dataset {
 
   // Constructors and assignment operators
   //
-  // A `flatflow::data::Dataset<I, S>` does not allow multiple data sets to
-  // exist at the same time. That is, copy constructor and copy assignment
-  // operator cannot be used.
+  // In addition to a constructor to build an inverted index,
+  // a `flatflow::data::Dataset<I, S>` supports a default constructor for
+  // declaration, as well as copy and move constructors and assignment
+  // operators.
+  //
+  // Note that even if a copy/move constructor or assignment operator is called,
+  // the data set is actually direct-initialized by copy elision.
+  // See https://en.cppreference.com/w/cpp/language/copy_elision.
   inline explicit Dataset() {}
 
   // Constructor to build an inverted index from the relative sizes for each
@@ -95,6 +100,13 @@ class Dataset {
     // Unlike counts and slots whose lengths are known at compile time (e.g.,
     // 65536 for 16-bit key type), the length of sizes is unpredictable so we
     // partially unroll loops over sizes.
+    //
+    // CAVEATS
+    //
+    // As of GCC 11.4.0, the unroll construct of OpenMP is ignored with an
+    // unknown pragma warning on compilation, regardless of whether it is
+    // partial or full. That is, the below loops will not actually be unrolled
+    // and we have to define our own portable loop unrolling macros.
     #pragma omp unroll partial
     for (value_type index = 0; index < sizes->size(); ++index) {
       const auto size = static_cast<std::size_t>(sizes->Get(index));
@@ -129,9 +141,9 @@ class Dataset {
     LOG(INFO) << absl::StrFormat("Construction of inverted index took %f seconds", omp_get_wtime() - now);
   }
 
-  Dataset(const Dataset &other) = delete;
+  inline explicit Dataset(const Dataset &other) = default;
 
-  Dataset &operator=(const Dataset &other) = delete;
+  inline Dataset &operator=(const Dataset &other) = default;
 
   inline explicit Dataset(Dataset &&other) = default;
 
