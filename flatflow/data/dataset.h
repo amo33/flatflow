@@ -15,6 +15,7 @@
 #ifndef FLATFLOW_DATA_DATASET_H_
 #define FLATFLOW_DATA_DATASET_H_
 
+#include <cblas.h>
 #include <omp.h>
 
 #include <algorithm>
@@ -57,14 +58,14 @@ namespace data {
 template <typename Index, typename Size>
   requires(internal::Unsigned<Index> && internal::Unsigned<Size>)
 class Dataset {
- public:
   using key_type = Size;
   using value_type = Index;
 
+ public:
   // Constructors and assignment operators
   //
   // In addition to a constructor to build an inverted index,
-  // a `flatflow::data::Dataset<I, S>` supports a default constructor for
+  // a `flatflow::data::Dataset<>` supports a default constructor for
   // declaration, as well as copy and move constructors and assignment
   // operators.
   //
@@ -75,8 +76,17 @@ class Dataset {
 
   // Constructor to build an inverted index from the relative sizes for each
   // data sample delivered from the Python frontend.
+  //
+  // CAVEATS
+  //
+  // This constructor is optimized for key types under 32 bits. It stores index
+  // slots in a temporary inlined vector using offsets and constructs the
+  // inverted index at once, which is fast but memory-intensive. For key types
+  // over 16 bits, this may bring too much memory pressure and the constructor
+  // needs to be specialized.
   inline explicit Dataset(
-      const flatbuffers::Vector<key_type, value_type> *sizes, value_type seed)
+      const flatbuffers::Vector<key_type, value_type> *sizes,
+      const value_type &seed)
       : seed_(seed) {
     const auto now = omp_get_wtime();
 
@@ -94,20 +104,13 @@ class Dataset {
     //   a B-tree.
     constexpr auto kIndexSlotSpace =
         static_cast<std::size_t>(1 << std::numeric_limits<key_type>::digits);
-    auto counts =
-        absl::InlinedVector<std::size_t, kIndexSlotSpace>(kIndexSlotSpace, 0);
+    auto counts = std::vector<double>(kIndexSlotSpace, 0.0);
 
-    // Unlike counts and slots whose lengths are known at compile time (e.g.,
-    // 65536 for 16-bit key type), the length of sizes is unpredictable so we
-    // partially unroll loops over sizes.
-    //
-    // CAVEATS
-    //
-    // As of GCC 11.4.0, the unroll construct of OpenMP is ignored with an
-    // unknown pragma warning on compilation, regardless of whether it is
-    // partial or full. That is, the below loops will not actually be unrolled
-    // and we have to define our own portable loop unrolling macros.
-    #pragma omp unroll partial
+    #pragma omp declare reduction(vadd : std::vector<double> : cblas_daxpy( \
+            static_cast<int>(omp_in.size()), 1.0, omp_in.data(), 1,         \
+                omp_out.data(), 1)) initializer(omp_priv = omp_orig)
+
+    #pragma omp parallel for reduction(vadd : counts)
     for (value_type index = 0; index < sizes->size(); ++index) {
       const auto size = static_cast<std::size_t>(sizes->Get(index));
       ++counts.at(size);
@@ -118,12 +121,22 @@ class Dataset {
 
     #pragma omp parallel for
     for (std::size_t size = 0; size < counts.size(); ++size) {
-      const auto count = counts.at(size);
+      const auto count = static_cast<std::size_t>(counts.at(size));
       if (0 < count) {
         slots.at(size).reserve(count);
       }
     }
 
+    // Unlike counts and slots whose lengths are known at compile time (e.g.,
+    // 65536 for 16-bit key type), the length of sizes is unpredictable so we
+    // partially unroll loops over sizes.
+    //
+    // CAVEATS
+    //
+    // As of GCC 11.4.0, the unroll construct of OpenMP is ignored with an
+    // unknown pragma warning on compilation, regardless of whether its clause
+    // is full or partial. That is, we have to define our own portable loop
+    // unrolling macros.
     #pragma omp unroll partial
     for (value_type index = 0; index < sizes->size(); ++index) {
       const auto size = static_cast<std::size_t>(sizes->Get(index));
@@ -132,13 +145,13 @@ class Dataset {
 
     #pragma omp unroll full
     for (std::size_t size = 0; size < slots.size(); ++size) {
-      const auto slot = slots.at(size);
+      auto &slot = slots.at(size);
       if (0 < slot.size()) {
         items_.try_emplace(static_cast<key_type>(size), std::move(slot));
       }
     }
 
-    LOG(INFO) << absl::StrFormat("Construction of inverted index took %f seconds", omp_get_wtime() - now);
+    LOG(INFO) << absl::StrFormat("Construction of inverted index took %fs", omp_get_wtime() - now);
   }
 
   inline explicit Dataset(const Dataset &other) = default;
@@ -153,7 +166,7 @@ class Dataset {
   //
   // Returns a data sample with the nearest size to the given size from inverted
   // index. This is equivalent to call `find()`.
-  inline std::pair<value_type, key_type> operator[](key_type size) {
+  inline std::pair<value_type, key_type> operator[](const key_type &size) {
     return find(size);
   }
 
@@ -161,7 +174,7 @@ class Dataset {
   //
   // Finds a data sample with the same, or at least nearest size to the given
   // size from inverted index.
-  inline std::pair<value_type, key_type> find(key_type size) {
+  inline std::pair<value_type, key_type> find(const key_type &size) {
     // The retrieval process of a data sample is described below:
     //
     // * First, find lower bound for the given size from inverted index. To find
@@ -226,24 +239,24 @@ class Dataset {
   // Dataset::on_batch_begin()
   //
   // A callback to be called at the beginning of a training batch.
-  inline void on_batch_begin([[maybe_unused]] value_type batch) const noexcept {
-  }
+  inline void on_batch_begin(
+      [[maybe_unused]] const value_type &batch) const noexcept {}
 
   // Dataset::on_batch_end()
   //
   // A callback to be called at the end of a training batch.
-  inline void on_batch_end([[maybe_unused]] value_type batch) const noexcept {}
+  inline void on_batch_end(
+      [[maybe_unused]] const value_type &batch) const noexcept {}
 
   // Dataset::on_epoch_begin()
   //
   // A callback to be called at the beginning of an epoch.
-  inline void on_epoch_begin(value_type epoch) {
+  inline void on_epoch_begin(const value_type &epoch) {
     const auto now = omp_get_wtime();
 
-    // At the beginning of each epoch, a `flatflow::data::Dataset<I, S>`
+    // At the beginning of each epoch, a `flatflow::data::Dataset<>`
     // shuffles between data samples with the same size, which we call
-    // intra-batch shuffling. The details of intra-batch shuffling are as
-    // follows:
+    // intra-batch shuffling. The details are as follows:
     //
     // * First, access each index slot in the inverted index. This can be
     //   parallelized since there is no data dependency between any couple of
@@ -260,13 +273,13 @@ class Dataset {
           std::shuffle(item.second.begin(), item.second.end(), generator);
         });
 
-    LOG(INFO) << absl::StrFormat("Epoch: %d intra-batch shuffling took %f seconds", epoch, omp_get_wtime() - now);
+    LOG(INFO) << absl::StrFormat("Epoch: %u intra-batch shuffling took %fs", epoch, omp_get_wtime() - now);
   }
 
   // Dataset::on_epoch_end()
   //
   // A callback to be called at the end of an epoch.
-  inline void on_epoch_end([[maybe_unused]] value_type epoch) {
+  inline void on_epoch_end([[maybe_unused]] const value_type &epoch) {
     internal::container::swap(items_, recyclebin_);
   }
 
