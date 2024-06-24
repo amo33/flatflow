@@ -1,5 +1,3 @@
-#include "flatflow/aten/native/attention.h"
-
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -9,6 +7,8 @@
 #include "torch/extension.h"
 #include "torch/torch.h"
 #include "torch/types.h"
+
+#include "flatflow/aten/native/attention.h"
 
 #define WARP_SIZE 32
 
@@ -258,66 +258,64 @@ void attention_forward(cublasHandle_t cublas_handle, float *output,
 std::vector<torch::Tensor> split_attention(
     torch::Tensor &QKV, const std::vector<std::size_t> &split_indices) {
   TORCH_INTERNAL_ASSERT(QKV.device().type() == torch::DeviceType::CUDA);
+  torch::Device device(torch::cuda::is_available() ? torch::kCUDA
+                                                   : torch::kCPU);
 
   torch::Tensor QKV_contiguous = QKV.contiguous();
   std::vector<torch::Tensor> split_tensors;
   std::vector<std::thread> attention_thread;
-  std::vector<cudaStream_t> streams(split_tensors.size());
-  std::vector<cublasHandle_t> handles(split_tensors.size());
-  std::vector<torch::Tensor> outputs(split_tensors.size());
-  int start = 0;
+  std::vector<cudaStream_t> streams(split_indices.size());
+  std::vector<cublasHandle_t> handles(split_indices.size());
+  std::vector<torch::Tensor> outputs(split_indices.size());
+  std::size_t start = 0;
+  std::size_t index = 0;
   const int block_size = 256;
   const int num_heads = 12;
 
-  std::vector<float *> post_attentions;
-  std::vector<float *> pre_split_inputs;
-  std::vector<float *> pre_attentions;
-  std::vector<float *> attentions;
-  std::vector<float *> inputs;
-
-  for (int end : split_indices) {
-    auto sliced_tensor = QKV_contiguous.narrow(0, start, end - start);
-    split_tensors.push_back(sliced_tensor);
-    outputs.push_back(
-        torch::empty(sliced_tensor.sizes(), sliced_tensor.options));
-    start = end;
-    cudaStreamCreate(&streams[i]);
-    cublasCreate(&handles[i]);
-
+  std::vector<float *> post_attentions(split_indices.size(), nullptr);
+  std::vector<float *> pre_split_inputs(split_indices.size(), nullptr);
+  std::vector<float *> pre_attentions(split_indices.size(), nullptr);
+  std::vector<float *> attentions(split_indices.size(), nullptr);
+  std::vector<float *> inputs(split_indices.size(), nullptr);
+  for (auto end : split_indices) {
+    auto sliced_tensor =
+        QKV_contiguous.narrow(0, start, end - start).to(torch::kCPU);
     auto sequence_length = sliced_tensor.sizes()[0];
     auto hidden_dim = sliced_tensor.sizes()[1] / 3;
-
-    cuda_check(cudaMalloc(&post_attentions[i],
-                          sequence_length * hidden_dim * sizeof(float)),
-               __FILE__, __LINE__);
-    cuda_check(cudaMalloc(&pre_split_inputs[i],
-                          sequence_length * 3 * hidden_dim * sizeof(float)),
-               __FILE__, __LINE__);
-    cuda_check(
-        cudaMalloc(&pre_attentions[i], num_heads * sequence_length *
-                                           sequence_length * sizeof(float)),
-        __FILE__, __LINE__);
-    cuda_check(cudaMalloc(&attentions[i], num_heads * sequence_length *
-                                              sequence_length * sizeof(float)),
-               __FILE__, __LINE__);
-    cuda_check(cudaMalloc(&inputs[i],
-                          sequence_length * 3 * hidden_dim * sizeof(float)),
-               __FILE__, __LINE__);
-    cuda_check(cudaMemcpy(inputs[i], split_tensors,
-                          sequence_length * 3 * hidden_dim * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               __FILE__, __LINE__);
+    split_tensors.push_back(sliced_tensor);
+    outputs[index] =
+        torch::empty({sequence_length, hidden_dim}, sliced_tensor.options())
+            .to(device);
+    start = end;
+    cudaStreamCreate(&streams[index]);
+    cublasCreate(&handles[index]);
+    cudaMalloc(&post_attentions[index],
+               sequence_length * hidden_dim * sizeof(float));
+    cudaMalloc(&pre_split_inputs[index],
+               sequence_length * 3 * hidden_dim * sizeof(float));
+    cudaMalloc(&pre_attentions[index],
+               num_heads * sequence_length * sequence_length * sizeof(float));
+    cudaMalloc(&attentions[index],
+               num_heads * sequence_length * sequence_length * sizeof(float));
+    cudaMalloc(&inputs[index],
+               sequence_length * 3 * hidden_dim * sizeof(float));
+    cudaCheck(cudaMemcpy(inputs[index], split_tensors[index].data_ptr<float>(),
+                         sequence_length * 3 * hidden_dim * sizeof(float),
+                         cudaMemcpyHostToDevice));
+    index++;
   }
-
+  std::cout << "Total splitted tensor: " << split_tensors.size() << "\n";
   for (std::size_t i = 0; i < split_tensors.size(); ++i) {
+    auto sequence_length = split_tensors[i].sizes()[0];
+    auto hidden_dim = split_tensors[i].sizes()[1] / 3;
     attention_thread.push_back(
         std::thread(attention_forward, handles[i], outputs[i].data_ptr<float>(),
                     post_attentions[i], pre_split_inputs[i], pre_attentions[i],
                     attentions[i], inputs[i], 1, sequence_length, hidden_dim,
                     num_heads, block_size, streams[i]));
   }
-  for (std::size_t i = 0; i < attention_forward.size(); ++i) {
-    attention_forward[i].join();
+  for (std::size_t i = 0; i < attention_thread.size(); ++i) {
+    attention_thread[i].join();
   }
 
   for (auto &stream : streams) {
@@ -331,11 +329,11 @@ std::vector<torch::Tensor> split_attention(
   }
 
   for (std::size_t i = 0; i < inputs.size(); ++i) {
-    cuda_check(cudaFree(post_attentions[i]), __FILE__, __LINE__);
-    cuda_check(cudaFree(pre_split_inputs[i]), __FILE__, __LINE__);
-    cuda_check(cudaFree(pre_attentions[i]), __FILE__, __LINE__);
-    cuda_check(cudaFree(attentions[i]), __FILE__, __LINE__);
-    cuda_check(cudaFree(inputs[i]), __FILE__, __LINE__);
+    cudaFree(post_attentions[i]);
+    cudaFree(pre_split_inputs[i]);
+    cudaFree(pre_attentions[i]);
+    cudaFree(attentions[i]);
+    cudaFree(inputs[i]);
   }
 
   return outputs;
