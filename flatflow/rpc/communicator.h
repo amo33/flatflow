@@ -14,6 +14,7 @@
 
 #ifndef FLATFLOW_RPC_COMMUNICATOR_H
 #define FLATFLOW_RPC_COMMUNICATOR_H
+
 #include <grpc++/grpc++.h>
 #include <grpc/support/log.h>
 
@@ -40,8 +41,7 @@ class CommunicatorImpl final : Communicator::service override {
     const flatflow::rpc::InitRequest *request = request_msg->GetRoot();
     if (request->rank() == 0) {
       LOG(INFO) << absl::StrFormat(
-          " Init called with world size : %d batch size: %d kind: %s," len(
-              request->),
+          " Init called with batch size: %d kind: %s,"),
           request->batch_size(), request->kind());
 
       dataset = flatflow::data::Dataset(request->sizes(), request->seed());
