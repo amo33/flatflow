@@ -35,13 +35,13 @@ namespace rpc {
 class CommunicatorImpl final : Communicator::service override {
   virtual grpc::Status Init(
       grpc::ServerContext *context,
-      const flatbuffers::grpc::Message<using flatflow::rpc::InitRequest>
+      const flatbuffers::grpc::Message<flatflow::rpc::InitRequest>
           *request_msg,
       flatbuffers::grpc::Message<flatflow::rpc::Empty> *response) {
     const flatflow::rpc::InitRequest *request = request_msg->GetRoot();
     if (request->rank() == 0) {
       LOG(INFO) << absl::StrFormat(
-          " Init called with batch size: %d kind: %s,"),
+          " Init called with batch size: %d kind: %s,",
           request->batch_size(), request->kind());
 
       dataset = flatflow::data::Dataset(request->sizes(), request->seed());
