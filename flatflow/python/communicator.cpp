@@ -22,10 +22,9 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(rpc, m) {
-  py::class_<flatflow::rpc::CommunicatorImpl,
-             flatflow::rpc::Communicator::Service>(m, "Communicator")
+  py::class_<flatflow::rpc::CommunicatorServiceImpl>(m, "Communicator")
       .def(py::init<>())
-      .def("init", &flatflow::rpc::CommunicatorImpl::Init)
-      .def("broadcast", &flatflow::rpc::CommunicatorImpl::Broadcast)
-      .def("finalize", &flatflow::rpc::CommunicatorImpl::Finalize);
+      .def("init", &flatflow::rpc::CommunicatorServiceImpl::Init)
+      .def("broadcast", &flatflow::rpc::CommunicatorServiceImpl::Broadcast)
+      .def("finalize", &flatflow::rpc::CommunicatorServiceImpl::Finalize);
 }

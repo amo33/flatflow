@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import multiprocessing
 import os
 import sys
 import subprocess
@@ -45,7 +46,14 @@ class CMakeBuild(build_ext):
         build_args = ['--config', cfg]
 
         cmake_args += ['-DCMAKE_BUILD_TYPE=' + cfg]
-        build_args += ['--', '-j32']
+        cpu_count = multiprocessing.cpu_count()
+        job_count = max(1, int(cpu_count * 1.5))
+        job_count = int(os.environ.get('BUILD_JOBS', job_count))
+        
+        max_jobs = 32
+        job_count = min(max_jobs, job_count)
+
+        build_args += ['--', f'-j{job_count}']
 
         env = os.environ.copy()
         env['CXXFLAGS'] = '{} -DVERSION_INFO=\\"{}\\"'.format(env.get('CXXFLAGS', ''),
@@ -66,8 +74,10 @@ setup(
     author='MaumAI',
     author_email='andy700@maum.ai',
     description='A pybind11 for rpc protocol',
+    install_requires=['pybind11[global]'],
     long_description='',
     ext_modules=[CMakeExtension('rpc')],
     cmdclass=dict(build_ext=CMakeBuild),
     zip_safe=False,
+    python_requires=">=3.9",
 )
