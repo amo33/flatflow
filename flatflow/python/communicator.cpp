@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "flatflow/rpc/communicator.h"
+
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "flatflow/rpc/communicator.h"
-#include "flatflow/rpc/communicator.grpc.fb.h"
-
 namespace py = pybind11;
 
 PYBIND11_MODULE(rpc, m) {
-  py::class_<flatflow::rpc::CommunicatorServiceImpl>(m, "Communicator")
-      .def(py::init<>())
-      .def("init", &flatflow::rpc::CommunicatorServiceImpl::Init)
-      .def("broadcast", &flatflow::rpc::CommunicatorServiceImpl::Broadcast)
-      .def("finalize", &flatflow::rpc::CommunicatorServiceImpl::Finalize);
+  m.doc() = "flatflow rpc library";
+  m.def("run", &flatflow::rpc::run, "A function that adds two numbers");
 }
