@@ -22,5 +22,5 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(rpc, m) {
   m.doc() = "flatflow rpc library";
-  m.def("run", &flatflow::rpc::run, "A function that adds two numbers");
+  m.def("run", &flatflow::rpc::run, "A function that calls the run method of the communicator");
 }
