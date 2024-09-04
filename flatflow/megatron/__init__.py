@@ -1,1 +1,1 @@
-from flatflow.megatron.gpt_dataset import FlatflowMegatronDataset
+from flatflow.megatron.gpt_dataset import FlatFlowMegatronDataset

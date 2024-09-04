@@ -56,7 +56,7 @@ model:
   sync_batch_comm: False
   megatron_amp_O2: False
 
-  flatflow_enabled: True
+  use_flatflow: True
 
   ## Sequence Parallelism
   # Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms and dropout sequentially

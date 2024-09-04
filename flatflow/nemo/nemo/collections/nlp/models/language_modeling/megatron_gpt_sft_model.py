@@ -39,7 +39,7 @@ from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.utils import AppState, logging
 
 import flatflow.torch
-from flatflow.megatron import FlatflowMegatronDataset
+from flatflow.megatron import FlatFlowMegatronDataset
 
 
 try:
@@ -102,7 +102,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             self._memory_profile_start_step = self.cfg.memory_profile.get('start_step', 0)
             self._memory_profile_end_step = self.cfg.memory_profile.get('end_step', 0)
 
-        self.flatflow_enabled = cfg.get("flatflow_enabled", False)
+        self.use_flatflow = cfg.get("use_flatflow", False)
         self.virtual_tokens = 0
         self.init_global_step = 0
 
@@ -269,8 +269,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
 
         dataset_kwargs = {}
         for file_path, num_samples in zip(data_cfg.file_names, num_train_samples_per_dataset):
-            if self.flatflow_enabled:
-                dataset_cls = FlatflowMegatronDataset
+            if self.use_flatflow:
+                dataset_cls = FlatFlowMegatronDataset
             elif self.cfg.data.get("chat", False):
                 dataset_cls = GPTSFTChatDataset
             elif packed_sequence:
@@ -325,7 +325,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             )
             datasets.append(dataset)
         if is_train:
-            if self.flatflow_enabled or packed_sequence:
+            if self.use_flatflow or packed_sequence:
                 num_train_samples_after_blend = sum(len(dataset) for dataset in datasets)
             dataset = BlendableDataset(
                 datasets=datasets, weights=data_cfg.concat_sampling_probabilities, size=num_train_samples_after_blend
@@ -363,7 +363,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         batch = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
         _, seq_length = batch['tokens'].shape
         num_microbatches = 0
-        if self.flatflow_enabled:
+        if self.use_flatflow:
             num_microbatches = 1
         else:
             num_microbatches = get_num_microbatches()
@@ -390,7 +390,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         fwd_bwd_function = get_forward_backward_func()
         num_microbatches = 0
         micro_batch_size = 0
-        if self.flatflow_enabled:
+        if self.use_flatflow:
             num_microbatches = self.cfg.data.train_ds.global_batch_size // get_num_microbatches()
             micro_batch_size = 1
         else:
@@ -861,7 +861,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             drop_last=data_cfg.drop_last,
             pad_samples_to_global_batch_size=not data_cfg.drop_last,
         )
-        if self.flatflow_enabled:
+        if self.use_flatflow:
             return flatflow.torch.utils.data.DataLoader(
                 dataset,
                 batch_sampler=batch_sampler,

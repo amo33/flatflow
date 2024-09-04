@@ -31,10 +31,10 @@ from nemo.utils import logging
 import flatflow.torch.utils.data
 
 
-__all__ = ['FlatflowMegatronDataset']
+__all__ = ['FlatFlowMegatronDataset']
 
 
-class FlatflowMegatronDataset(flatflow.torch.utils.data.Dataset):
+class FlatFlowMegatronDataset(flatflow.torch.utils.data.Dataset):
     """
     A dataset class implementing interfaces for TEDotProductAttention and Flatflow scheduler. 
 
