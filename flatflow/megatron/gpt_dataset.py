@@ -76,7 +76,6 @@ class FlatFlowMegatronDataset(flatflow.torch.utils.data.Dataset):
         ceil_to_power_2: bool = False,
         get_attention_mask_from_fusion: bool = False,
     ):
-        np.random.seed(kwargs.get('seed', 1234))
         self.tokenizer = tokenizer
         self.file_path = file_path
         self.max_seq_length = max_seq_length
@@ -122,7 +121,132 @@ class FlatFlowMegatronDataset(flatflow.torch.utils.data.Dataset):
         # Will be None after this call if `max_num_samples` is None
         self._build_samples_mapping()
         self._process_dataset()
+    def _multiple_truncation(self, template_ids: List[List[int]], template_ids_keys: List[str]):
+        """
+        Calculate total tokens and truncate multiple contexts in truncation_fields.
 
+        Args:
+            template_ids (List[List[int]]): the list of separate prompt_template ids.
+            template_ids_keys (List[str]): the list of placeholder keys or <template> (used to check key in truncation_fields).
+
+        Returns:
+            context_ids (List[int]): all context ids.
+            label_ids (List[int]): all label ids.
+        """
+        context_ids = template_ids[:-1]
+        label_ids = template_ids[-1]
+        total_ids = (
+            self.virtual_tokens
+            + sum(len(ids) for ids in context_ids)
+            + max(len(label_ids), self.tokens_to_generate)
+            + self.add_bos
+            + self.add_sep
+            + self.add_eos  # Only training need to consider eos token
+        )
+
+        if total_ids > self.max_seq_length:
+            truncation_length_total = total_ids - self.max_seq_length
+            num_fields = len(self.truncation_fields)
+            # sorted equal divide length to each field
+            # examples:
+            #   truncation_length_total = 3
+            #   num_fields = 11
+            #   truncation_length_list = [3,4,4]
+            truncation_length_list = [
+                truncation_length_total // num_fields + (1 if i < truncation_length_total % num_fields else 0)
+                for i in range(num_fields)[::-1]
+            ]
+
+            for i, (ids, key) in enumerate(zip(template_ids, template_ids_keys)):
+                if key in self.truncation_fields:
+                    truncation_length = truncation_length_list.pop()
+                    if len(ids) < truncation_length:
+                        logging.warning(f'{key} is not long enough to truncate.')
+                        truncation_length = len(ids)
+
+                    if self.truncation_method == 'left':
+                        window_offset = truncation_length
+                    elif self.truncation_method == 'right':
+                        window_offset = 0
+                    else:
+                        raise ValueError(f'{self.truncation_method} is not supported')
+
+                    window_length = len(ids) - truncation_length
+                    template_ids[i] = ids[window_offset : window_offset + window_length]
+
+        context_ids = [i for ids in template_ids[:-1] for i in ids]
+        label_ids = template_ids[-1]
+        return context_ids, label_ids
+
+    def _process_example(self, example):
+        """
+        Create an example by concatenating text and answer.
+        Truncation is carried out when needed, but it is performed only on the prompt side.
+        BOS, EOS, and SEP, are added if specified.
+        """
+        prompt_template_values = []
+        for c in self.prompt_template_keys:
+            try:
+                prompt_template_values.append(example[c].strip(' '))
+            except KeyError as e:
+                if c == self.label_key and self.is_test:
+                    # allow missing label during testing, if user only wants to do inference without calculating metrics
+                    prompt_template_values.append("")
+                else:
+                    raise e
+
+        template_strings, template_strings_keys = self._separate_template(prompt_template_values)
+        template_ids = [self.tokenizer.text_to_ids(s) for s in template_strings]
+        context_ids, answer_ids = self._multiple_truncation(template_ids, template_strings_keys)
+
+        if self.virtual_tokens:
+            # (@adithyare) we are going to insert "pad/eos" tokens in the beginning of the text and context
+            # these pad/eos tokens are placeholders for virtual tokens
+            context_ids = [self.tokenizer.eos_id] * self.virtual_tokens + context_ids
+
+        input_ids = context_ids
+        answer_start_idx = len(input_ids)
+
+        # Adds bos token in the start
+        if self.add_bos:
+            context_ids = [self.tokenizer.bos_id] + context_ids
+            input_ids = [self.tokenizer.bos_id] + input_ids
+            answer_start_idx += 1
+
+        # Adds sep token between text/prompt and answer
+        if self.add_sep:
+            context_ids = context_ids + [self.sep_id]
+            input_ids = input_ids + [self.sep_id]
+            answer_start_idx += 1
+
+        input_ids = input_ids + answer_ids
+
+        # Only training need to consider eos token
+        if self.add_eos:
+            input_ids = input_ids + [self.tokenizer.eos_id]
+
+        if len(input_ids) > self.max_seq_length:
+            logging.warning(f'Input ids length {len(input_ids)} exceed max sequence length {self.max_seq_length}')
+            input_ids = input_ids[: self.max_seq_length]
+            answer_ids = input_ids[answer_start_idx:]
+
+        # store metadata in dataset, in case user may have keys required in the prediction json files
+        metadata = {k: v for k, v in example.items() if k not in self.prompt_template_keys}
+        if self.output_original_text:
+            for orig_text, text_key in zip(template_strings, template_strings_keys):
+                metadata[text_key] = orig_text
+
+        processed_example = {
+            'input_ids': input_ids,
+            'answer_start_idx': answer_start_idx,
+            'context_ids': context_ids,
+            'context_length': len(context_ids),
+            'answer_ids': answer_ids,
+            'metadata': metadata,
+            'token_count': len(input_ids),
+        }
+        return processed_example
+    
     def _load_dataset(self):
         if self.hf_dataset:
             self.indexed_dataset = load_dataset(
