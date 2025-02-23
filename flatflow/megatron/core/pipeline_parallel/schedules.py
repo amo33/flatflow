@@ -17,6 +17,7 @@
 import contextlib
 from typing import Iterator, List, Union
 
+import nvtx
 import torch
 from torch.autograd.variable import Variable
 
@@ -387,10 +388,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if memory_profiler is not None and global_microbatch_id is not None:
         memory_profiler.set_microbatch_id(global_microbatch_id)
 
-    if config.deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
-    else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    with nvtx.annotate(color="blue", domain="backward", category=f"{global_microbatch_id}"):
+        if config.deallocate_pipeline_outputs:
+            custom_backward(output_tensor[0], output_tensor_grad[0])
+        else:
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
