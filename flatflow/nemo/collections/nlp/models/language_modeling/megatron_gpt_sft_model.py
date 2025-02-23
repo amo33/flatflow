@@ -19,6 +19,7 @@ import json
 from functools import partial
 from typing import Any, Optional
 
+import nvtx
 import torch
 from nemo.collections.common.metrics import MetricStringToTorchMetric
 from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import (
@@ -1133,7 +1134,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             if memory_profiler is not None and global_microbatch_id is not None:
                 memory_profiler.set_microbatch_id(global_microbatch_id)
 
-            output_tensor = model(**forward_args)
+            with nvtx.annotate(color="green", domain="forward", category=f"{global_microbatch_id}"):
+                output_tensor = model(**forward_args)
 
             def loss_func(output_tensor):
                 # Loss for a micro-batch (ub)
