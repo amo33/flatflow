@@ -606,7 +606,7 @@ def forward_backward_pipelining_with_interleaving(
 
     global total_microbatch_id
     config = get_model_config(model[0])
-    if compute_profiler is not None and memory_profiler is not None:
+    if compute_profiler is not None or memory_profiler is not None:
         config.deallocate_pipeline_outputs = False
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
