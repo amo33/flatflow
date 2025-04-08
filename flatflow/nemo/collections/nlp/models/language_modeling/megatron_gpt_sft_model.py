@@ -119,8 +119,11 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
 
         self.use_flatflow = cfg.get("use_flatflow", True)
         self.enable_profile = cfg.get("enable_profile", True)
-
-        if self.use_flatflow:
+        self.is_experiment = cfg.get("is_experiment", False) # enable this if running split-attention baseline
+        # if running baseline we need to turn on two factors.
+        # 1. use flatflow sampler
+        # 2. make batch.append(microbatch) like flatflow in fwd_bwd_step
+        if self.use_flatflow or self.is_experiment:
             if isinstance(self.model, list):
                 config = get_model_config(self.model[0])
             else:
@@ -302,7 +305,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         dataset_kwargs = {}
         for file_path, num_samples in zip(data_cfg.file_names, num_train_samples_per_dataset):
             # flatflow is applied only for training
-            if self.use_flatflow and is_train:
+            if (self.use_flatflow or self.is_experiment and not packed_sequence ) and is_train:
                 dataset_cls = flatflow.nemo.collections.nlp.data.language_modeling.megatron.GPTSFTDataset
             elif self.cfg.data.get("chat", False):
                 dataset_cls = GPTSFTChatDataset
@@ -359,7 +362,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             )
             datasets.append(dataset)
         if is_train:
-            if self.use_flatflow or packed_sequence or num_train_samples_after_blend is None:
+            if self.use_flatflow or self.is_experiment or packed_sequence or num_train_samples_after_blend is None:
                 num_train_samples_after_blend = sum(len(dataset) for dataset in datasets)
             if self.use_flatflow:
                 dataset = flatflow.nemo.collections.nlp.data.language_modeling.megatron.BlendableDataset(
@@ -393,7 +396,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         # call like validation_step otherwise return tuple
         # (in which case dataloader_iter is still a PTL _DataFetcherWrapper object)
         num_microbatches = get_num_microbatches()
-        if not self.use_flatflow:
+        if not self.use_flatflow and not self.is_experiment:
             micro_batch_size = get_micro_batch_size()
             if isinstance(dataloader_iter, _DataFetcherWrapper):
                 batch, _, _ = next(dataloader_iter)
