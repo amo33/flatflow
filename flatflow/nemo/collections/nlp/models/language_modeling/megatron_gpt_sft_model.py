@@ -1082,12 +1082,12 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
                 if "sample_ids" in batch and isinstance(batch["sample_ids"], (list, tuple)):
                     micro_bs_logic = len(batch["sample_ids"])  # logical micro-batch size
                 else:
-                    micro_bs_logic = forward_args["input_ids"].size(0)
+                    micro_bs_logic = forward_args["input_ids"].size(0) if forward_args["input_ids"] is not None else 0
 
                 meta_info = {
                     "micro_bs": micro_bs_logic,
                     "global_bs": micro_bs_logic * parallel_state.get_data_parallel_world_size(),
-                    "tok_total": forward_args["input_ids"].numel(),
+                    "tok_total": forward_args["input_ids"].numel() if forward_args["input_ids"] is not None else 0,
                 }
 
                 with flatflow.torch.profiler.MemoryProfiler.profile(tag=f"forward-{global_microbatch_id}", **meta_info):

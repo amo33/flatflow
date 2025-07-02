@@ -101,12 +101,21 @@ class MegatronPretrainingBatchSampler(BaseMegatronBatchSampler):
         self.dataset = dataset
         self.global_rank = torch.distributed.get_rank()
         self.epoch = 0
-        self.indices = []
+        
+        indices = list(range(len(self.dataset)))
+        remainder = len(indices) % self.data_parallel_size
+        if remainder != 0:
+            num_pad = self.data_parallel_size - remainder
+            # 실제 인덱스 반복 또는 -1 패딩
+            self.indices = indices + indices[:num_pad]
+        else:
+            self.indices = indices
+        
         self.world_size = torch.distributed.get_world_size()
         self.num_data_parallel_group = self.world_size // (
             self.tensor_parallel_world_size * self.pipeline_parallel_world_size
         )
-        sizes = [sys.getsizeof(self.dataset, index) for index in range(len(self.dataset))]
+        sizes = [sys.getsizeof(self.dataset, index) if index >=0 else 0 for index in range(self.indices)]
 
         addr = os.getenv("MASTER_ADDR")
         channel = grpc.insecure_channel(f"{addr}:{port}")
@@ -136,14 +145,13 @@ class MegatronPretrainingBatchSampler(BaseMegatronBatchSampler):
         self.epoch = epoch
 
     def __iter__(self):
-        indices = list(range(len(self.dataset)))
         model_parallel_group = parallel_state.get_model_parallel_group()
         model_parallel_src_rank = torch.distributed.get_process_group_ranks(model_parallel_group)[0]
         is_model_parallel_src = (self.global_rank == model_parallel_src_rank)
 
         # receive the reordered computation schedule from the control plane
         if is_model_parallel_src:
-            self.schedule = self.client.Scatter(self.epoch, indices)
+            self.schedule = self.client.Scatter(self.epoch, self.indices)
             self.schedule_size = [len(self.schedule)]
             self.epoch += 1
 

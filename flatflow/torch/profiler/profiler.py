@@ -128,8 +128,10 @@ class ComputeProfiler:
         if self.rank == 0:
             assert data_object is not None
             revised = [data for data in data_object if data is not None]
+            # Convert any tensors or non-serializable objects to JSON-serializable format
+            serializable_revised = MemoryProfiler._convert_tensor_to_json_serializable(revised)
             with open("latency_profile.json", "w") as f:
-                json.dump(revised, f, indent=4)
+                json.dump(serializable_revised, f, indent=4)
 
     def _generate_batch_key(self, microbatch_id: int) -> str:
         data_parallel_rank = parallel_state.get_data_parallel_rank()
@@ -241,6 +243,28 @@ class MemoryProfiler:
         return f"memory_profile_rank{rank}_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}.jsonl"
     
     @staticmethod
+    def _serialize(obj):
+        if isinstance(obj, torch.Tensor):
+            # Convert tensor to list or scalar
+            if obj.numel() == 1:
+                return obj.item()  # Convert single-element tensor to scalar
+            else:
+                return obj.detach().cpu().tolist()  # Convert tensor to list
+        elif isinstance(obj, (list, tuple)):
+            return [MemoryProfiler._serialize(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {k: MemoryProfiler._serialize(v) for k, v in obj.items()}
+        elif hasattr(obj, 'item') and callable(getattr(obj, 'item')):
+            try:
+                return obj.item()
+            except (ValueError, TypeError):
+                return str(obj)
+        elif isinstance(obj, (int, float, str, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+    
+    @staticmethod
     @contextlib.contextmanager
     def profile(tag: str = "", **metadata):
         if not torch.cuda.is_available():
@@ -281,7 +305,8 @@ class MemoryProfiler:
         try:
             os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
 
-            record = {"tag": tag, **new_data}
+            serializable_data = MemoryProfiler._serialize(new_data)
+            record = {"tag": tag, **serializable_data}
             with open(output_file, 'a') as f:
                 f.write(json.dumps(record) + '\n')
 
