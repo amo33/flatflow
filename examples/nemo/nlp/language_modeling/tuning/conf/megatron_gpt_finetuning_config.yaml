@@ -89,6 +89,7 @@ model:
   enable_profile: True
   use_bpipe: False
   batch_p2p_comm: False
+
   peft:
     peft_scheme: "adapter"  # can be either "adapter", "ia3", or "ptuning"
     restore_from_path: null
