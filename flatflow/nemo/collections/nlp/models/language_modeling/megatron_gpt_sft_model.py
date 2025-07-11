@@ -388,6 +388,21 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         else:
             return base_key + f"dataloader{dataloader_idx}"
 
+    def training_step(self, dataloader_iter):
+        result = super() .training_step(dataloader_iter)
+        if self.use_flatflow:
+            from megatron.core.num_microbatches_calculator import get_num_microbatches
+            num_microbatches = get_num_microbatches()
+            logical_global_step = self.trainer.global_step * num_microbatches
+            micro_batch_size = self.cfg.get ('micro_batch_size', 1)
+            data_parallel_size = self.trainer.world_size // (
+                self.cfg.get ('tensor_model_parallel_size', 1) * self.cfg.get ('pipeline_model_parallel_size', 1)
+            )
+            logical_consumed_samples = logical_global_step * micro_batch_size * num_microbatches * data_parallel_size
+            self.log('global_step', logical_global_step, prog_bar=True, rank_zero_only=True, batch_size=1) 
+            self.log('consumed_samples', logical_consumed_samples, prog_bar=True, rank_zero_only=True, batch_size=1)
+        return result
+
     def fwd_bwd_step(self, dataloader_iter, forward_only, first_val_step=None):
         # Return only batch if batch, batch_idx, dataloder_idx are extracted as a tuple in the previous func
         # call like validation_step otherwise return tuple
