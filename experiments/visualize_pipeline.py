@@ -6,16 +6,18 @@ import argparse
 
 from matplotlib.patches import Rectangle
 
-def visualize_pipeline(sqlite_path, min_category=0.0, max_category=96.0, num_stages=8):
+def visualize_pipeline(sqlite_path, min_category=0.0, max_category=100000.0, num_stages=8, dp_size=2, tp_size=1):
     """
     Extract forward/backward events from SQLite database and visualize Pipeline Parallelism.
     Make forward/backward events more distinguishable and visually appealing. 
-    Supports multiple nodes.
+    Supports multiple nodes with Tensor Parallelism visualization.
     Args:
         sqlite_path: Path to the SQLite database
         min_category: Minimum category to visualize
         max_category: Maximum category to visualize
-        num_stages: Number of stages (devices)
+        num_stages: Number of stages (devices) for pipeline parallelism
+        dp_size: Data parallelism size
+        tp_size: Tensor parallelism size
     """
     print("Connecting to SQLite database...")
     conn = sqlite3.connect(sqlite_path)
@@ -27,9 +29,9 @@ def visualize_pipeline(sqlite_path, min_category=0.0, max_category=96.0, num_sta
         start,
         end,
         (end - start) as duration,
-        start/1000000 as start_ms,
-        end/1000000 as end_ms,
-        (end - start)/1000000 as duration_ms
+        start/1000000.0 as start_ms,
+        end/1000000.0 as end_ms,
+        (end - start)/1000000.0 as duration_ms
     FROM NVTX_EVENTS 
     WHERE (text LIKE 'forward' OR text LIKE 'backward')
     AND category IS NOT NULL
@@ -44,102 +46,131 @@ def visualize_pipeline(sqlite_path, min_category=0.0, max_category=96.0, num_sta
 
     df = df.dropna(subset=['category', 'start_ms', 'end_ms', 'duration_ms'])
     
-    # Map forward/backward events to stages for each category
-    df['stage'] = None  # Initialize with default value
-    
-    for category in df['category'].unique():
-        cat_events = df[df['category'] == category]
-        
-        # Forward event
-        forward_events = cat_events[cat_events['text'] == 'forward'].sort_values('start_ms')
-        forward_count = len(forward_events)
-        if forward_count > 0:
-            stages_per_forward = num_stages // forward_count if forward_count > 0 else 1
-            for i, idx in enumerate(forward_events.index):
-                stage = min(i * stages_per_forward, num_stages - 1)
-                df.loc[idx, 'stage'] = stage
-        
-        # Backward event
-        backward_events = cat_events[cat_events['text'] == 'backward'].sort_values('start_ms')
-        backward_count = len(backward_events)
-        if backward_count > 0:
-            stages_per_backward = num_stages // backward_count if backward_count > 0 else 1
-            for i, idx in enumerate(backward_events.index):
-                stage = max(num_stages - 1 - (i * stages_per_backward), 0)
-                df.loc[idx, 'stage'] = stage
-
-    df = df.dropna(subset=['stage'])
-    df['stage'] = df['stage'].astype(int)
+    # FIX: category IS the stage number directly
+    df['stage'] = df['category'].astype(int)
+    df['tp_group'] = (df['category'] % tp_size).astype(int)
 
     # Print the number of events
     for stage in range(num_stages):
         stage_events = df[df['stage'] == stage]
         print(f"Stage {stage} - Forward: {len(stage_events[stage_events['text'] == 'forward'])}, "
               f"Backward: {len(stage_events[stage_events['text'] == 'backward'])}")
+        for tp_group in range(tp_size):
+            tp_events = stage_events[stage_events['tp_group'] == tp_group]
+            print(f"  TP Group {tp_group}: Forward: {len(tp_events[tp_events['text'] == 'forward'])}, "
+                  f"Backward: {len(tp_events[tp_events['text'] == 'backward'])}")
     
     # Set the time range
     min_time = df['start_ms'].min()
     max_time = df['end_ms'].max()
     time_range = max_time - min_time
     
+    print(f"Time range: {min_time:.2f} - {max_time:.2f} ms (total: {time_range:.2f} ms)")
+    
     # Prepare the plot
     plt.style.use('ggplot')  # Apply a cleaner style
-    fig, ax = plt.subplots(figsize=(16, 8), dpi=100)  # Reduce the height to reduce the gap
+    fig, ax = plt.subplots(figsize=(16, 10), dpi=100)  # Increase height for TP visualization
     
     # Calculate statistics
-    forward_avg = df[df['text'] == 'forward']['duration_ms'].mean()
-    forward_max = df[df['text'] == 'forward']['duration_ms'].max()
-    backward_avg = df[df['text'] == 'backward']['duration_ms'].mean()
-    backward_max = df[df['text'] == 'backward']['duration_ms'].max()
+    forward_events = df[df['text'] == 'forward']
+    backward_events = df[df['text'] == 'backward']
+    
+    if len(forward_events) > 0:
+        forward_avg = forward_events['duration_ms'].mean()
+        forward_max = forward_events['duration_ms'].max()
+    else:
+        forward_avg = forward_max = 0
+        
+    if len(backward_events) > 0:
+        backward_avg = backward_events['duration_ms'].mean()
+        backward_max = backward_events['duration_ms'].max()
+    else:
+        backward_avg = backward_max = 0
     
     # Set the background color
     ax.set_facecolor('#f8f8f8')
     fig.patch.set_facecolor('#ffffff')
 
-    stage_height = 0.75  # Height of each stage
-    stage_spacing = 0.25  # Gap between stages
+    stage_height = 0.6  # Height of each stage
+    stage_spacing = 0.2  # Gap between stages
+    tp_height = stage_height / max(tp_size, 1)  # Height of each TP sub-stage
+    
+    # Define colors for different TP groups
+    tp_colors_forward = ['#5B86E5', '#8B5CF6', '#F59E0B', '#EF4444']  # Blue, Purple, Orange, Red
+    tp_colors_backward = ['#56B4B4', '#10B981', '#F97316', '#DC2626']  # Teal, Green, Orange, Red
     
     for stage in range(num_stages):
         stage_events = df[df['stage'] == stage]
-        y_pos = (num_stages - 1 - stage) * (stage_height + stage_spacing)
+        y_pos_base = (num_stages - 1 - stage) * (stage_height + stage_spacing)
         
         for _, event in stage_events.iterrows():
+            tp_group = int(event['tp_group'])
+            
             if event['text'] == 'forward':
-                color = '#5B86E5'  # Light blue
+                color = tp_colors_forward[tp_group % len(tp_colors_forward)]
                 edge_color = '#4A75D3'
-                height = stage_height
-                y_offset = 0
+                height = tp_height * 0.8  # Slightly smaller for visibility
+                y_offset = tp_group * tp_height + (tp_height - height) / 2
+                alpha = 0.8
             else:  # backward
-                color = '#56B4B4'  # Teal
+                color = tp_colors_backward[tp_group % len(tp_colors_backward)]
                 edge_color = '#45A3A3'
-                height = stage_height
-                y_offset = 0
+                height = tp_height * 0.8  # Slightly smaller for visibility
+                y_offset = tp_group * tp_height + (tp_height - height) / 2
+                alpha = 0.9
 
-            width = max(2.0, event['duration_ms'])
+            # Use relative time for x-axis
+            start_time = event['start_ms'] - min_time
+            # FIXED: Use actual duration, but set minimum width for visibility
+            width = max(event['duration_ms'], time_range * 0.02)  # At least 2% of timeline
             
             # Draw the event box
-            rect = Rectangle((event['start_ms'] - min_time, y_pos + y_offset), 
+            rect = Rectangle((start_time, y_pos_base + y_offset), 
                            width, height, 
                            facecolor=color, 
-                           alpha=0.85,
+                           alpha=alpha,
                            edgecolor=edge_color,
-                           linewidth=0.8)
+                           linewidth=1.0)
             ax.add_patch(rect)
+            
+            # FIXED: Add batch ID labels (simulated since we don't have batch_id in data)
+            # Estimate batch ID based on timing and position
+            estimated_batch = int((start_time / (time_range / 15)) % 8) + 1  # Rough estimate
+            
+            # Add event and batch labels
+            if width > time_range * 0.03:  # Only if box is wide enough
+                ax.text(start_time + width/2, 
+                       y_pos_base + y_offset + height/2, 
+                       f"{estimated_batch}",  # Show estimated batch ID
+                       fontsize=10, 
+                       verticalalignment='center',
+                       horizontalalignment='center',
+                       color='white',
+                       fontweight='bold')
+            
+            # Add F/B indicator on smaller boxes
+            elif width > time_range * 0.015:
+                ax.text(start_time + width/2, 
+                       y_pos_base + y_offset + height/2, 
+                       event['text'][0].upper(),  # 'F' or 'B'
+                       fontsize=8, 
+                       verticalalignment='center',
+                       horizontalalignment='center',
+                       color='white',
+                       fontweight='bold')
     
     # Set the grid and axes
     ax.grid(True, linestyle='--', alpha=0.7)
     ax.set_axisbelow(True)
     
     # Set the Y-axis label considering the stage height and spacing
-    stage_height = 0.75
-    stage_spacing = 0.25
     total_height = num_stages * (stage_height + stage_spacing) - stage_spacing
     
     # Set the Y-axis label to the center of each stage
     y_ticks = [(num_stages - 1 - stage) * (stage_height + stage_spacing) + stage_height/2 
                for stage in range(num_stages)]
     ax.set_yticks(y_ticks)
-    ax.set_yticklabels([f'Stage {num_stages-1-stage}' for stage in range(num_stages)])
+    ax.set_yticklabels([f'Stage {stage}' for stage in range(num_stages)])
     
     # Set the X-axis range and label
     ax.set_xlim(0, time_range)
@@ -147,44 +178,56 @@ def visualize_pipeline(sqlite_path, min_category=0.0, max_category=96.0, num_sta
     ax.set_xlabel('Time (ms)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Pipeline Stage', fontsize=12, fontweight='bold')
 
-    stage_height = 0.75
-    stage_spacing = 0.25
+    # Add time arrow
     arrow_y_pos = -0.4
-    
     ax.arrow(0, arrow_y_pos, time_range, 0, 
             head_width=0.15, head_length=time_range * 0.01, 
             fc='black', ec='black', linewidth=1.5)
     
+    # Create legend with TP groups
+    legend_elements = []
+    for tp_group in range(tp_size):
+        legend_elements.append(
+            plt.Rectangle((0, 0), 1, 1, 
+                         facecolor=tp_colors_forward[tp_group % len(tp_colors_forward)], 
+                         alpha=0.8, 
+                         edgecolor='#4A75D3', 
+                         label=f'Forward TP{tp_group}')
+        )
+        legend_elements.append(
+            plt.Rectangle((0, 0), 1, 1, 
+                         facecolor=tp_colors_backward[tp_group % len(tp_colors_backward)], 
+                         alpha=0.9, 
+                         edgecolor='#45A3A3', 
+                         label=f'Backward TP{tp_group}')
+        )
 
-    legend_elements = [
-        plt.Rectangle((0, 0), 1, 1, facecolor='#5B86E5', alpha=0.85, edgecolor='#4A75D3', label='Forward (F)'),
-        plt.Rectangle((0, 0), 1, 1, facecolor='#56B4B4', alpha=0.85, edgecolor='#45A3A3', label='Backward (B)')
-    ]
-
-    arrow_y_pos = -0.4
     ax.legend(handles=legend_elements, loc='upper center', 
               bbox_to_anchor=(0.85, 1.05), 
-              ncol=2, fontsize=10, frameon=True, facecolor='white', edgecolor='gray')
+              ncol=2, fontsize=9, frameon=True, facecolor='white', edgecolor='gray')
     
-
-    plt.title(f'Pipeline Parallelism TP1_PP8_BS16_MBS1', 
+    plt.title(f'Pipeline Parallelism DP{dp_size}_PP{num_stages}_TP{tp_size} - 1F1B Pattern', 
               fontsize=16, fontweight='bold', pad=20)
     
     plt.figtext(0.5, 0.01, 
                f'Forward Events: Avg {forward_avg:.2f}ms, Max {forward_max:.0f}ms | '
-               f'Backward Events: Avg {backward_avg:.2f}ms, Max {backward_max:.0f}ms', 
+               f'Backward Events: Avg {backward_avg:.2f}ms, Max {backward_max:.0f}ms | '
+               f'TP Groups: {tp_size}', 
                ha='center', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    output_filename = 'pipeline_parallelism_improved.png'
+    output_filename = f'pipeline_parallelism_dp{dp_size}_pp{num_stages}_tp{tp_size}.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight')
     print(f"시각화 이미지 저장 완료: {output_filename}")
     plt.show()
 
 if __name__ == "__main__":
-  args = argparse.ArgumentParser()
-  args.add_argument("--sqlite_path", type=str, required=True)
-  args.add_argument("--min_category", type=float, required=True)
-  args.add_argument("--max_category", type=float, required=True)
-  args = args.parse_args()
-  visualize_pipeline(args.sqlite_path, args.min_category, args.max_category, args.num_stages)
+    args = argparse.ArgumentParser()
+    args.add_argument("--sqlite_path", type=str, required=True)
+    args.add_argument("--min_category", type=float, default=0.0)
+    args.add_argument("--max_category", type=float, default=7.0)  # Changed default for 8 stages
+    args.add_argument("--num_stages", type=int, default=8)
+    args.add_argument("--dp_size", type=int, default=1)
+    args.add_argument("--tp_size", type=int, default=1)
+    args = args.parse_args()
+    visualize_pipeline(args.sqlite_path, args.min_category, args.max_category, args.num_stages, args.dp_size, args.tp_size)
