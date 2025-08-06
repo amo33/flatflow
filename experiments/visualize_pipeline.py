@@ -4,6 +4,7 @@ import dataclasses
 import itertools
 import json
 import re
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import drawsvg as draw
@@ -14,9 +15,83 @@ import colorsys
 class EventData:
     events: list
     duration: int
+    tp_size: int = 1  # Tensor parallel size
+    pp_size: int = 1  # Pipeline parallel size
 
 
 FBW_PATTERN = re.compile("^[F|B|W].*$")
+TP_PATTERN = re.compile(r".*tp(\d+).*", re.IGNORECASE)
+
+
+def extract_tp_info_from_events(events: List[List[Dict]]) -> int:
+    """이벤트에서 TP 크기를 추출합니다."""
+    tp_size = 1
+    for stage_events in events:
+        for event in stage_events:
+            for field_data in event.get("fields", []):
+                if "tp_rank" in field_data or "tensor_parallel_rank" in field_data:
+                    tp_rank = field_data.get("tp_rank") or field_data.get("tensor_parallel_rank")
+                    if tp_rank is not None:
+                        tp_size = max(tp_size, tp_rank + 1)
+
+            event_type = event.get("type", "")
+            match = TP_PATTERN.match(event_type)
+            if match:
+                tp_size = max(tp_size, int(match.group(1)))
+            
+            if "tensor_parallel" in event_type.lower():
+                tp_match = re.search(r'tensor_parallel[_-]?(\d+)', event_type.lower())
+                if tp_match:
+                    tp_size = max(tp_size, int(tp_match.group(1)))
+                tp_match = re.search(r'tp[_-]?(\d+)', event_type.lower())
+                if tp_match:
+                    tp_size = max(tp_size, int(tp_match.group(1)))
+    
+    return tp_size
+
+
+def extract_pp_info_from_events(events: List[List[Dict]]) -> int:
+    pp_size = 1
+    for stage_events in events:
+        for event in stage_events:
+            for field_data in event.get("fields", []):
+                if "pp_rank" in field_data or "pipeline_parallel_rank" in field_data:
+                    pp_rank = field_data.get("pp_rank") or field_data.get("pipeline_parallel_rank")
+                    if pp_rank is not None:
+                        pp_size = max(pp_size, pp_rank + 1)
+    
+    return pp_size
+
+
+def group_events_by_tp(events: List[List[Dict]], tp_size: int) -> List[List[List[Dict]]]:
+    if tp_size <= 1:
+        return events
+
+    tp_grouped_events = []
+    for stage_events in events:
+        tp_groups = [[] for _ in range(tp_size)]
+        
+        for event in stage_events:
+            tp_rank = 0
+            for field_data in event.get("fields", []):
+                if "tp_rank" in field_data:
+                    tp_rank = field_data["tp_rank"]
+                    break
+                elif "tensor_parallel_rank" in field_data:
+                    tp_rank = field_data["tensor_parallel_rank"]
+                    break
+            
+            # If TP rank is out of range, set it to 0
+            if tp_rank >= tp_size:
+                tp_rank = 0
+            
+            tp_groups[tp_rank].append(event)
+        
+        # Process each TP group as one stage
+        for tp_rank in range(tp_size):
+            tp_grouped_events.append(tp_groups[tp_rank])
+    
+    return tp_grouped_events
 
 
 def is_fbwo(text):
@@ -27,17 +102,28 @@ def load_kth_iteration(filename, k, enable_comm=True, exclude_previous_iteration
     with open(filename) as f:
         data = json.loads(f.read())
 
+    # Check if optimizer events exist
+    has_optimizer = any(any(e["type"] == "Optimizer" for e in dev_evs) for dev_evs in data)
+    
     if k == 0:
         start_time = 0
-    else:
+    elif has_optimizer:
+        # If optimizer events exist, use the existing logic
         if exclude_previous_iteration:
             start_time = min(find_kth_optimizer(dev_evs, k - 1)["end_time"] for dev_evs in data)
         else:
             start_time = min(find_kth_optimizer(dev_evs, k - 1)["start_time"] for dev_evs in data)
+    else:
+        # If no optimizer events, use the entire time range
+        start_time = 0
     
-    try:
-        end_time = max(find_kth_optimizer(dev_evs, k)["end_time"] for dev_evs in data)
-    except ValueError:
+    if has_optimizer:
+        try:
+            end_time = max(find_kth_optimizer(dev_evs, k)["end_time"] for dev_evs in data)
+        except ValueError:
+            # If no optimizer events, use the entire time range
+            end_time = max(max(e["end_time"] for e in dev_evs) for dev_evs in data)
+    else:
         # If no optimizer events, use the entire time range
         end_time = max(max(e["end_time"] for e in dev_evs) for dev_evs in data)
 
@@ -62,6 +148,12 @@ def load_kth_iteration(filename, k, enable_comm=True, exclude_previous_iteration
                 e["start_time"] -= iter_start_time
                 e["end_time"] -= iter_start_time
 
+    # Get TP and PP size
+    tp_size = extract_tp_info_from_events(events)
+    pp_size = extract_pp_info_from_events(events)
+    
+    print(f"{filename}: TP size = {tp_size}, PP size = {pp_size}")
+
     nvtx_names = set()
     for e in sum(events, []):
         nvtx_names.update(get_nvtx_names(e["type"]))
@@ -69,6 +161,8 @@ def load_kth_iteration(filename, k, enable_comm=True, exclude_previous_iteration
     return EventData(
         events=events,
         duration=duration,
+        tp_size=tp_size,
+        pp_size=pp_size,
     )
 
 def find_kth_optimizer(stage_events, k):
@@ -262,7 +356,7 @@ class DrawCtx:
 
 def draw_events(setting: PlotSetting, file_event_data, output_filename, include_w=True, include_o=True, tail=50):
     canvas_info_list = [
-        CanvasInfo(setting, d.events, tail, center_title_height=0, enable_info=True) for d in file_event_data
+        CanvasInfo(setting, d.events, tail, center_title_height=0, enable_info=True, tp_size=d.tp_size) for d in file_event_data
     ]
     span_height = setting.span_height
     height_sum = sum(info.get_canvas_size()[0] + span_height for info in canvas_info_list)
@@ -283,8 +377,9 @@ def draw_events(setting: PlotSetting, file_event_data, output_filename, include_
 
 
 class CanvasInfo:
-    def __init__(self, setting: PlotSetting, events, tail, center_title_height, enable_info=True):
+    def __init__(self, setting: PlotSetting, events, tail, center_title_height, enable_info=True, tp_size=1):
         self.setting = setting
+        self.tp_size = tp_size
         time_per_unit = setting.time_per_unit
 
         last_time = max(max([e["end_time"] for e in dev_evs]) for dev_evs in events)
@@ -292,8 +387,14 @@ class CanvasInfo:
 
         border_size = setting.border_size
         span_height = setting.span_height
-        comp_comm_events = split_comm_events_if_exists(events)
-        self.height = span_height * len(comp_comm_events) + border_size * (len(comp_comm_events) + 1)
+        comp_comm_events = split_comm_events_if_exists(events, tp_size)
+
+        if tp_size > 1:
+            # comp_comm_events is already grouped by TP
+            self.height = span_height * len(comp_comm_events) + border_size * (len(comp_comm_events) + 1)
+        else:
+            self.height = span_height * len(comp_comm_events) + border_size * (len(comp_comm_events) + 1)
+            
         color_text_row_height = int(span_height * 1.6)
         self.color_text_height = color_text_row_height + border_size
         self.info_height = span_height + color_text_row_height + 3 * border_size
@@ -306,7 +407,7 @@ class CanvasInfo:
         return self.height + self.info_height + self.center_title_height, self.max_len + self.setting.title_width
 
 
-def split_comm_events_if_exists(events):
+def split_comm_events_if_exists(events, tp_size=1):
     new_events = []
     comm_found = False
     for stage, evs in enumerate(events):
@@ -316,9 +417,11 @@ def split_comm_events_if_exists(events):
             if FBWO_PATTERN.match(e["type"]):
                 comp_evs.append(e)
                 continue
-            assert COMM_PATTERN.match(e["type"])
-            comm_evs.append(e)
-            comm_found = True
+            elif COMM_PATTERN.match(e["type"]):
+                comm_evs.append(e)
+                comm_found = True
+            else:
+                comp_evs.append(e)
         new_events.append(comp_evs)
         new_events.append(comm_evs)
     if not comm_found:
@@ -330,6 +433,7 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
     max_len = canvas_info.max_len
     height = canvas_info.height
     color_text_height = canvas_info.color_text_height
+    tp_size = canvas_info.tp_size
 
     setting = ctx.setting
     data_ctx = DrawCtx.from_base_ctx(ctx, 0, setting.title_width)
@@ -339,7 +443,7 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
     time_per_unit = setting.time_per_unit
     enable_border = setting.enable_border
 
-    comp_comm_events = split_comm_events_if_exists(events)
+    comp_comm_events = split_comm_events_if_exists(events, tp_size)
     enable_comm = len(comp_comm_events) > len(events)
 
     for i, evs in enumerate(comp_comm_events):
@@ -380,7 +484,14 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
                 data_ctx.text(h, center, microbatch)
             elif setting.enable_type:
                 center = (start + end) // 2
-                data_ctx.text(h, center, e["type"])
+                # TP 정보가 있으면 함께 표시
+                event_text = e["type"]
+                if tp_size > 1:
+                    for field_data in e.get("fields", []):
+                        if "tp_rank" in field_data:
+                            event_text += f"(TP{field_data['tp_rank']})"
+                            break
+                data_ctx.text(h, center, event_text)
         if enable_border:
             data_ctx.line(h+span_height, 0, h+span_height+border_size, max_len - 1)
 
@@ -391,11 +502,14 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
 
     dev_title_ctx = DrawCtx.from_base_ctx(ctx, 0, 0)
     ndev = len(comp_comm_events)
+    
+    # 디바이스 번호 생성
     if enable_comm:
         devs = sum([[i, i] for i in range(len(events))], [])
     else:
         devs = list(range(len(events)))
-    add_devices(dev_title_ctx, devs)
+    
+    add_devices(dev_title_ctx, devs, tp_size)
 
     if not include_info:
         return
@@ -419,14 +533,20 @@ def plot_span(ctx, start, end, h, color):
         ctx.rect_frame(h-border_size, start, span_height + border_size, end - start)
 
 
-def add_devices(ctx, devs):
+def add_devices(ctx, devs, tp_size=1):
     setting = ctx.setting
     border_size = setting.border_size
     span_height = setting.span_height
     unit_size = setting.unit_size
+    
     for i, dev in enumerate(devs):
         h = i * span_height + (i + 1) * border_size
-        ctx.text(h, 6 * unit_size, "Device {}".format(dev), "left")
+        
+        if tp_size > 1:
+            pp_stage = dev // tp_size
+            ctx.text(h, 6 * unit_size, f"PP{pp_stage}", "left")
+        else:
+            ctx.text(h, 6 * unit_size, "PP {}".format(dev), "left")
 
 
 def add_info(ctx, color_text_height, include_w=True, include_o=True):
@@ -481,6 +601,11 @@ def render_svg_graph(args):
 
     file_event_data = [load_kth_iteration(input_json, args.iteration, args.enable_comm) for input_json in input_json_files]
     first_event_data = file_event_data[0]
+    
+    # Debug for TP and PP size
+    print(f"Detected TP size: {first_event_data.tp_size}")
+    print(f"Detected PP size: {first_event_data.pp_size}")
+    
     time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
